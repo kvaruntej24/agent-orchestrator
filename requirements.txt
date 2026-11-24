@@ -11,3 +11,5 @@ fakeredis
 sqlalchemy
 psycopg[binary]
 chromadb
+fastapi
+httpx

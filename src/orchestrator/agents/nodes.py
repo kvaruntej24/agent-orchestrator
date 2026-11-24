@@ -3,6 +3,7 @@ from typing import Any
 
 from src.orchestrator.agents.planner import TaskPlanner
 from src.orchestrator.agents.state import AgentState
+from src.orchestrator.memory.maintenance import compute_importance_score
 from src.orchestrator.memory.long_term_memory import LongTermMemoryStore
 from src.orchestrator.memory.retrieval import MemoryRetriever
 from src.orchestrator.memory.working_memory import WorkingMemoryStore
@@ -272,8 +273,9 @@ def reviewer_node(
             "trace_log": [f"reviewer: failed task due to unrecovered error ({state['last_error']})"],
         }
         if long_term_memory is not None:
-            merged_state: AgentState = {**state, **updates}  # type: ignore[typeddict-item]
-            long_term_memory.record_completed_task(merged_state, importance_score=0.3)
+            merged_state: AgentState = {**state, **updates}  
+            score = compute_importance_score(merged_state)
+            long_term_memory.record_completed_task(merged_state, importance_score=score)
         return updates
 
     successful_results = [
@@ -301,9 +303,9 @@ def reviewer_node(
             "trace_log": ["reviewer: approved output"],
         }
         if long_term_memory is not None:
-            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
-            long_term_memory.record_completed_task(merged_state, importance_score=0.8)
-            updates["trace_log"].append("reviewer: archived task into long-term memory")
+            merged_state: AgentState = {**state, **updates}  
+            score = compute_importance_score(merged_state)
+            long_term_memory.record_completed_task(merged_state, importance_score=score)
         return updates
 
     next_cycles = state["review_cycles"] + 1
@@ -323,8 +325,9 @@ def reviewer_node(
             "trace_log": [f"reviewer: failed after exceeding max review cycles ({next_cycles})"],
         }
         if long_term_memory is not None:
-            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
-            long_term_memory.record_completed_task(merged_state, importance_score=0.3)
+            merged_state: AgentState = {**state, **updates} 
+            score = compute_importance_score(merged_state)
+            long_term_memory.record_completed_task(merged_state, importance_score=score)
         return updates
 
     rewind_index = max(0, len(state["plan"]) - 1)
