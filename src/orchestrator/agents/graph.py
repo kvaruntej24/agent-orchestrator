@@ -10,6 +10,7 @@ from src.orchestrator.agents.nodes import (
 )
 from src.orchestrator.agents.planner import TaskPlanner
 from src.orchestrator.agents.state import AgentState
+from src.orchestrator.memory.working_memory import WorkingMemoryStore
 from src.orchestrator.tools.builtin import register_builtin_tools
 from src.orchestrator.tools.registry import ToolRegistry
 
@@ -46,23 +47,20 @@ def build_graph(
     planner: TaskPlanner | None = None,
     registry: ToolRegistry | None = None,
     review_policy: ReviewPolicy | None = None,
+    working_memory: WorkingMemoryStore | None = None,
 ) -> Any:
-    """Assemble and compile the full Phase 1 LangGraph state machine.
-
-    Supports multi-step DAG execution, bounded tool-error retry loops,
-    and bounded reviewer rejection cycles.
-    """
+    """Assemble and compile the LangGraph state machine with optional Redis memory."""
     active_planner = planner or TaskPlanner()
     active_registry = registry or register_builtin_tools(ToolRegistry())
 
     def _supervisor(state: AgentState) -> dict[str, Any]:
-        return supervisor_node(state, planner=active_planner)
+        return supervisor_node(state, planner=active_planner, working_memory=working_memory)
 
     def _specialist(state: AgentState) -> dict[str, Any]:
-        return specialist_node(state, registry=active_registry)
+        return specialist_node(state, registry=active_registry, working_memory=working_memory)
 
     def _reviewer(state: AgentState) -> dict[str, Any]:
-        return reviewer_node(state, review_policy=review_policy)
+        return reviewer_node(state, review_policy=review_policy, working_memory=working_memory)
 
     builder = StateGraph(AgentState)
 

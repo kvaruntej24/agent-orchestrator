@@ -3,6 +3,7 @@ from typing import Any
 
 from src.orchestrator.agents.planner import TaskPlanner
 from src.orchestrator.agents.state import AgentState
+from src.orchestrator.memory.working_memory import WorkingMemoryStore
 from src.orchestrator.tools.builtin import register_builtin_tools
 from src.orchestrator.tools.registry import ToolRegistry
 
@@ -10,9 +11,20 @@ from src.orchestrator.tools.registry import ToolRegistry
 ReviewPolicy = Callable[[str, AgentState], tuple[bool, str]]
 
 
+def _persist_state(
+    working_memory: WorkingMemoryStore | None,
+    task_id: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Best-effort write to working memory when configured."""
+    if working_memory is not None:
+        working_memory.save_state(task_id, snapshot)
+
+
 def supervisor_node(
     state: AgentState,
     planner: TaskPlanner | None = None,
+    working_memory: WorkingMemoryStore | None = None,
 ) -> dict[str, Any]:
     """Decompose the user request once into a DAG plan, then route the next step."""
     active_planner = planner or TaskPlanner()
@@ -26,6 +38,10 @@ def supervisor_node(
             f"supervisor: generated {len(serialized_plan)}-step plan "
             f"({execution_plan.goal_summary})"
         )
+        if working_memory is not None:
+            working_memory.set_context(state["task_id"], "user_request", state["user_request"])
+            working_memory.set_context(state["task_id"], "goal_summary", execution_plan.goal_summary)
+            working_memory.set_context(state["task_id"], "plan", serialized_plan)
     else:
         serialized_plan = existing_plan
         step_idx = state["current_step_index"]
@@ -41,6 +57,17 @@ def supervisor_node(
         serialized_plan[step_idx]["specialist"]
         if step_idx < len(serialized_plan)
         else ""
+    )
+
+    _persist_state(
+        working_memory,
+        state["task_id"],
+        {
+            "phase": "supervisor",
+            "current_step_index": step_idx,
+            "assigned_specialist": next_specialist,
+            "review_status": state["review_status"],
+        },
     )
 
     return {
@@ -70,7 +97,6 @@ def _select_tool_call(
             },
         )
 
-    # Default writer path: compile prior findings and persist a draft report
     prior_summaries = [
         f"- [{r['specialist']}] {r['output']}"
         for r in state["subtask_results"]
@@ -96,6 +122,7 @@ def _select_tool_call(
 def specialist_node(
     state: AgentState,
     registry: ToolRegistry | None = None,
+    working_memory: WorkingMemoryStore | None = None,
 ) -> dict[str, Any]:
     """Execute the current subtask using the ToolRegistry with structured error tracking."""
     active_registry = registry or register_builtin_tools(ToolRegistry())
@@ -127,6 +154,19 @@ def specialist_node(
             "status": "error",
             "attempt": next_retry,
         }
+        if working_memory is not None:
+            working_memory.append_subtask_output(state["task_id"], failed_record)
+            working_memory.set_context(state["task_id"], "last_error", error_msg)
+        _persist_state(
+            working_memory,
+            state["task_id"],
+            {
+                "phase": "specialist_error",
+                "current_step_index": step_idx,
+                "retry_count": next_retry,
+                "last_error": error_msg,
+            },
+        )
         return {
             "subtask_results": [failed_record],
             "retry_count": next_retry,
@@ -137,7 +177,6 @@ def specialist_node(
             ],
         }
 
-    # For file_write, expose the written draft content so the Reviewer can inspect it
     output_payload = (
         tool_args["content"] if tool_name == "file_write" else tool_result.output
     )
@@ -151,6 +190,19 @@ def specialist_node(
         "duration_ms": tool_result.duration_ms,
         "status": "success",
     }
+    if working_memory is not None:
+        working_memory.append_subtask_output(state["task_id"], success_record)
+        working_memory.set_context(state["task_id"], f"output_{step_id}", output_payload)
+    _persist_state(
+        working_memory,
+        state["task_id"],
+        {
+            "phase": "specialist_done",
+            "current_step_index": step_idx + 1,
+            "retry_count": 0,
+            "last_error": "",
+        },
+    )
     return {
         "subtask_results": [success_record],
         "current_step_index": step_idx + 1,
@@ -173,12 +225,19 @@ def _default_review_policy(latest_output: str, state: AgentState) -> tuple[bool,
 def reviewer_node(
     state: AgentState,
     review_policy: ReviewPolicy | None = None,
+    working_memory: WorkingMemoryStore | None = None,
 ) -> dict[str, Any]:
     """Validate final output, fail cleanly on exhausted retries, or trigger revision."""
     if state["last_error"]:
+        feedback = f"Halted after retries exhausted: {state['last_error']}"
+        _persist_state(
+            working_memory,
+            state["task_id"],
+            {"phase": "reviewer_failed", "review_status": "failed", "feedback": feedback},
+        )
         return {
             "review_status": "failed",
-            "review_feedback": f"Halted after retries exhausted: {state['last_error']}",
+            "review_feedback": feedback,
             "confidence_score": 0.0,
             "final_output": "",
             "trace_log": [f"reviewer: failed task due to unrecovered error ({state['last_error']})"],
@@ -193,6 +252,14 @@ def reviewer_node(
     approved, feedback = policy(latest_output, state)
 
     if approved:
+        if working_memory is not None:
+            working_memory.set_context(state["task_id"], "review_feedback", feedback)
+            working_memory.set_context(state["task_id"], "final_output", latest_output)
+        _persist_state(
+            working_memory,
+            state["task_id"],
+            {"phase": "completed", "review_status": "approved", "confidence_score": 0.92},
+        )
         return {
             "review_status": "approved",
             "review_feedback": feedback,
@@ -203,17 +270,34 @@ def reviewer_node(
 
     next_cycles = state["review_cycles"] + 1
     if next_cycles > state["max_review_cycles"]:
+        fail_feedback = f"Max review cycles exceeded. Last feedback: {feedback}"
+        _persist_state(
+            working_memory,
+            state["task_id"],
+            {"phase": "reviewer_failed", "review_status": "failed", "feedback": fail_feedback},
+        )
         return {
             "review_status": "failed",
             "review_cycles": next_cycles,
-            "review_feedback": f"Max review cycles exceeded. Last feedback: {feedback}",
+            "review_feedback": fail_feedback,
             "confidence_score": 0.3,
             "final_output": latest_output,
             "trace_log": [f"reviewer: failed after exceeding max review cycles ({next_cycles})"],
         }
 
-    # Rewind to the final step so the writer revises using review_feedback
     rewind_index = max(0, len(state["plan"]) - 1)
+    if working_memory is not None:
+        working_memory.set_context(state["task_id"], "review_feedback", feedback)
+    _persist_state(
+        working_memory,
+        state["task_id"],
+        {
+            "phase": "reviewer_rejected",
+            "review_status": "rejected",
+            "review_cycles": next_cycles,
+            "feedback": feedback,
+        },
+    )
     return {
         "review_status": "rejected",
         "review_cycles": next_cycles,
