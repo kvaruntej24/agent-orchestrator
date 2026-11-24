@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     working_memory_ttl_seconds: int = 3600
     postgres_dsn: str = "postgresql+psycopg://postgres:postgres@localhost:5432/agent_orchestrator"
     chroma_persist_dir: str = "chroma_data"
+    hitl_confidence_threshold: float = 0.75
+    hitl_consecutive_failure_cap: int = 2
 
 
 def get_settings() -> Settings:
