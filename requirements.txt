@@ -8,3 +8,6 @@ pytest
 mcp
 redis
 fakeredis
+sqlalchemy
+psycopg[binary]
+chromadb
