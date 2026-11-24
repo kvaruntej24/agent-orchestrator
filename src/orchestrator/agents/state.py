@@ -6,7 +6,9 @@ class AgentState(TypedDict):
     """Shared state passed between all nodes in the orchestration graph."""
 
     task_id: str
+    user_id: str
     user_request: str
+    retrieved_memory_context: str
     plan: list[dict[str, Any]]
     current_step_index: int
     assigned_specialist: str
@@ -26,13 +28,16 @@ class AgentState(TypedDict):
 def create_initial_state(
     task_id: str,
     user_request: str,
+    user_id: str = "default",
     max_retries: int = 2,
     max_review_cycles: int = 2,
 ) -> AgentState:
     """Create a valid starting state for a new orchestration run."""
     return {
         "task_id": task_id,
+        "user_id": user_id,
         "user_request": user_request,
+        "retrieved_memory_context": "",
         "plan": [],
         "current_step_index": 0,
         "assigned_specialist": "",

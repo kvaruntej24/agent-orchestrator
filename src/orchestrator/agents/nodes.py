@@ -3,6 +3,8 @@ from typing import Any
 
 from src.orchestrator.agents.planner import TaskPlanner
 from src.orchestrator.agents.state import AgentState
+from src.orchestrator.memory.long_term_memory import LongTermMemoryStore
+from src.orchestrator.memory.retrieval import MemoryRetriever
 from src.orchestrator.memory.working_memory import WorkingMemoryStore
 from src.orchestrator.tools.builtin import register_builtin_tools
 from src.orchestrator.tools.registry import ToolRegistry
@@ -25,16 +27,41 @@ def supervisor_node(
     state: AgentState,
     planner: TaskPlanner | None = None,
     working_memory: WorkingMemoryStore | None = None,
+    memory_retriever: MemoryRetriever | None = None,
 ) -> dict[str, Any]:
-    """Decompose the user request once into a DAG plan, then route the next step."""
+    """Retrieve relevant past memory, decompose the request once, and route the next step."""
     active_planner = planner or TaskPlanner()
     existing_plan = state["plan"]
+    memory_block = state["retrieved_memory_context"]
+    trace_entries: list[str] = []
 
     if not existing_plan:
-        execution_plan = active_planner.create_plan(state["user_request"])
+        if memory_retriever is not None:
+            retrieved = memory_retriever.retrieve_for_planning(
+                user_request=state["user_request"],
+                user_id=state["user_id"],
+            )
+            memory_block = retrieved.formatted_prompt_block
+            trace_entries.append(
+                "supervisor: retrieved memory "
+                f"(strategies={len(retrieved.past_strategies)}, "
+                f"tools={len(retrieved.tool_precedents)}, "
+                f"prefs={len(retrieved.user_preferences)})"
+            )
+            if working_memory is not None and memory_block:
+                working_memory.set_context(
+                    state["task_id"],
+                    "retrieved_memory_context",
+                    memory_block,
+                )
+
+        execution_plan = active_planner.create_plan(
+            state["user_request"],
+            memory_context=memory_block,
+        )
         ordered = execution_plan.ordered_subtasks()
         serialized_plan = [task.model_dump() for task in ordered]
-        trace_entry = (
+        trace_entries.append(
             f"supervisor: generated {len(serialized_plan)}-step plan "
             f"({execution_plan.goal_summary})"
         )
@@ -50,7 +77,7 @@ def supervisor_node(
             if step_idx < len(serialized_plan)
             else "done"
         )
-        trace_entry = f"supervisor: dispatching {step_label}"
+        trace_entries.append(f"supervisor: dispatching {step_label}")
 
     step_idx = state["current_step_index"]
     next_specialist = (
@@ -73,7 +100,8 @@ def supervisor_node(
     return {
         "plan": serialized_plan,
         "assigned_specialist": next_specialist,
-        "trace_log": [trace_entry],
+        "retrieved_memory_context": memory_block,
+        "trace_log": trace_entries,
     }
 
 
@@ -226,8 +254,9 @@ def reviewer_node(
     state: AgentState,
     review_policy: ReviewPolicy | None = None,
     working_memory: WorkingMemoryStore | None = None,
+    long_term_memory: LongTermMemoryStore | None = None,
 ) -> dict[str, Any]:
-    """Validate final output, fail cleanly on exhausted retries, or trigger revision."""
+    """Validate final output, trigger revision if needed, and archive terminal runs."""
     if state["last_error"]:
         feedback = f"Halted after retries exhausted: {state['last_error']}"
         _persist_state(
@@ -235,13 +264,17 @@ def reviewer_node(
             state["task_id"],
             {"phase": "reviewer_failed", "review_status": "failed", "feedback": feedback},
         )
-        return {
+        updates: dict[str, Any] = {
             "review_status": "failed",
             "review_feedback": feedback,
             "confidence_score": 0.0,
             "final_output": "",
             "trace_log": [f"reviewer: failed task due to unrecovered error ({state['last_error']})"],
         }
+        if long_term_memory is not None:
+            merged_state: AgentState = {**state, **updates}  # type: ignore[typeddict-item]
+            long_term_memory.record_completed_task(merged_state, importance_score=0.3)
+        return updates
 
     successful_results = [
         r for r in state["subtask_results"] if r.get("status") == "success"
@@ -260,13 +293,18 @@ def reviewer_node(
             state["task_id"],
             {"phase": "completed", "review_status": "approved", "confidence_score": 0.92},
         )
-        return {
+        updates = {
             "review_status": "approved",
             "review_feedback": feedback,
             "confidence_score": 0.92,
             "final_output": latest_output,
             "trace_log": ["reviewer: approved output"],
         }
+        if long_term_memory is not None:
+            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
+            long_term_memory.record_completed_task(merged_state, importance_score=0.8)
+            updates["trace_log"].append("reviewer: archived task into long-term memory")
+        return updates
 
     next_cycles = state["review_cycles"] + 1
     if next_cycles > state["max_review_cycles"]:
@@ -276,7 +314,7 @@ def reviewer_node(
             state["task_id"],
             {"phase": "reviewer_failed", "review_status": "failed", "feedback": fail_feedback},
         )
-        return {
+        updates = {
             "review_status": "failed",
             "review_cycles": next_cycles,
             "review_feedback": fail_feedback,
@@ -284,6 +322,10 @@ def reviewer_node(
             "final_output": latest_output,
             "trace_log": [f"reviewer: failed after exceeding max review cycles ({next_cycles})"],
         }
+        if long_term_memory is not None:
+            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
+            long_term_memory.record_completed_task(merged_state, importance_score=0.3)
+        return updates
 
     rewind_index = max(0, len(state["plan"]) - 1)
     if working_memory is not None:

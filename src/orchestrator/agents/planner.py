@@ -111,6 +111,7 @@ class TaskPlanner:
         self.model_name = model_name
         self.mock = mock
         self._structured_llm: Any | None = None
+        self.last_memory_context: str = ""
 
     def _get_structured_llm(self) -> Any:
         if self._structured_llm is None:
@@ -123,31 +124,37 @@ class TaskPlanner:
             self._structured_llm = llm.with_structured_output(ExecutionPlan)
         return self._structured_llm
 
-    def create_plan(self, user_request: str) -> ExecutionPlan:
-        """Generate and validate an ExecutionPlan for the given request."""
+    def create_plan(
+        self,
+        user_request: str,
+        memory_context: str = "",
+    ) -> ExecutionPlan:
+        """Generate and validate an ExecutionPlan enriched with optional memory context."""
         if not user_request or not user_request.strip():
             raise ValueError("user_request must be a non-empty string.")
 
+        self.last_memory_context = memory_context.strip()
+
         if self.mock:
-            return self._mock_plan(user_request)
+            return self._mock_plan(user_request, self.last_memory_context)
 
         try:
             llm = self._get_structured_llm()
-            plan: ExecutionPlan = llm.invoke(
-                [
-                    SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-                    HumanMessage(content=user_request),
-                ]
-            )
+            messages: list[Any] = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)]
+            if self.last_memory_context:
+                messages.append(SystemMessage(content=self.last_memory_context))
+            messages.append(HumanMessage(content=user_request))
+            plan: ExecutionPlan = llm.invoke(messages)
             return plan
         except Exception as exc:
             raise RuntimeError(f"Task decomposition failed: {exc}") from exc
 
     @staticmethod
-    def _mock_plan(user_request: str) -> ExecutionPlan:
+    def _mock_plan(user_request: str, memory_context: str = "") -> ExecutionPlan:
         """Deterministic multi-step plan for offline verification and unit tests."""
+        goal_suffix = " (memory-informed)" if memory_context else ""
         return ExecutionPlan(
-            goal_summary=f"Execute and verify request: {user_request}",
+            goal_summary=f"Execute and verify request: {user_request}{goal_suffix}",
             subtasks=[
                 Subtask(
                     step_id="step_1",
