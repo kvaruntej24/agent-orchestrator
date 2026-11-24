@@ -1,0 +1,7 @@
+langgraph
+langchain-openai
+langchain-anthropic
+pydantic
+pydantic-settings
+python-dotenv
+pytest
