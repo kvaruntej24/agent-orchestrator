@@ -3,8 +3,10 @@ from typing import Any
 
 from src.orchestrator.agents.planner import TaskPlanner
 from src.orchestrator.agents.state import AgentState
-from src.orchestrator.memory.maintenance import compute_importance_score
+from src.orchestrator.hitl.approval_queue import ApprovalQueue, ReviewRequest
+from src.orchestrator.hitl.triggers import EscalationPolicy
 from src.orchestrator.memory.long_term_memory import LongTermMemoryStore
+from src.orchestrator.memory.maintenance import compute_importance_score
 from src.orchestrator.memory.retrieval import MemoryRetriever
 from src.orchestrator.memory.working_memory import WorkingMemoryStore
 from src.orchestrator.tools.builtin import register_builtin_tools
@@ -152,8 +154,10 @@ def specialist_node(
     state: AgentState,
     registry: ToolRegistry | None = None,
     working_memory: WorkingMemoryStore | None = None,
+    escalation_policy: EscalationPolicy | None = None,
+    approval_queue: ApprovalQueue | None = None,
 ) -> dict[str, Any]:
-    """Execute the current subtask using the ToolRegistry with structured error tracking."""
+    """Execute the current subtask, pausing for HITL approval when guardrails fire."""
     active_registry = registry or register_builtin_tools(ToolRegistry())
     step_idx = state["current_step_index"]
 
@@ -168,6 +172,43 @@ def specialist_node(
     step_id = current_task["step_id"]
 
     tool_name, tool_args = _select_tool_call(specialist, current_task, state)
+
+    # Pre-execution HITL gate (skips if this step_id was already human-approved)
+    if escalation_policy is not None and step_id not in state["approved_steps"]:
+        decision = escalation_policy.evaluate(
+            state=state,
+            pending_tool_name=tool_name,
+            pending_tool_args=tool_args,
+            registry=active_registry,
+        )
+        if decision.should_escalate:
+            review_req = ReviewRequest.from_escalation(
+                task_id=state["task_id"],
+                thread_id=state["task_id"],
+                step_id=step_id,
+                decision=decision,
+            )
+            if approval_queue is not None:
+                approval_queue.enqueue(review_req)
+            _persist_state(
+                working_memory,
+                state["task_id"],
+                {
+                    "phase": "awaiting_human_approval",
+                    "step_id": step_id,
+                    "review_id": review_req.review_id,
+                    "reason": decision.reason,
+                },
+            )
+            return {
+                "approval_status": "pending",
+                "pending_approval": review_req.model_dump(),
+                "trace_log": [
+                    f"specialist({specialist}): paused {step_id} for HITL approval "
+                    f"(review_id={review_req.review_id}, reason={decision.reason})"
+                ],
+            }
+
     tool_result = active_registry.execute(tool_name, tool_args)
 
     if not tool_result.success:
@@ -244,6 +285,51 @@ def specialist_node(
     }
 
 
+def human_approval_node(
+    state: AgentState,
+    working_memory: WorkingMemoryStore | None = None,
+) -> dict[str, Any]:
+    """Process a human approve/reject decision after LangGraph resumes from checkpoint."""
+    pending = state["pending_approval"] or {}
+    decision_payload = state["human_decision"] or {}
+    step_id = str(pending.get("step_id", "unknown_step"))
+    reviewer = str(decision_payload.get("reviewer", "human_reviewer"))
+    comment = str(decision_payload.get("reviewer_comment", ""))
+    decision_status = str(decision_payload.get("status", state["approval_status"]))
+
+    if decision_status == "approved":
+        _persist_state(
+            working_memory,
+            state["task_id"],
+            {"phase": "human_approved", "step_id": step_id, "reviewer": reviewer},
+        )
+        return {
+            "approval_status": "none",
+            "pending_approval": None,
+            "approved_steps": [step_id],
+            "trace_log": [
+                f"human_approval: '{step_id}' approved by {reviewer}"
+                + (f" ({comment})" if comment else "")
+            ],
+        }
+
+    rejection_msg = (
+        f"Human reviewer '{reviewer}' rejected '{step_id}'"
+        + (f": {comment}" if comment else "")
+    )
+    _persist_state(
+        working_memory,
+        state["task_id"],
+        {"phase": "human_rejected", "step_id": step_id, "reviewer": reviewer},
+    )
+    return {
+        "approval_status": "none",
+        "pending_approval": None,
+        "last_error": rejection_msg,
+        "trace_log": [f"human_approval: {rejection_msg}"],
+    }
+
+
 def _default_review_policy(latest_output: str, state: AgentState) -> tuple[bool, str]:
     """Baseline deterministic quality gate for offline validation."""
     if not latest_output or len(latest_output.strip()) < 20:
@@ -259,7 +345,7 @@ def reviewer_node(
 ) -> dict[str, Any]:
     """Validate final output, trigger revision if needed, and archive terminal runs."""
     if state["last_error"]:
-        feedback = f"Halted after retries exhausted: {state['last_error']}"
+        feedback = f"Halted: {state['last_error']}"
         _persist_state(
             working_memory,
             state["task_id"],
@@ -270,10 +356,10 @@ def reviewer_node(
             "review_feedback": feedback,
             "confidence_score": 0.0,
             "final_output": "",
-            "trace_log": [f"reviewer: failed task due to unrecovered error ({state['last_error']})"],
+            "trace_log": [f"reviewer: failed task ({state['last_error']})"],
         }
         if long_term_memory is not None:
-            merged_state: AgentState = {**state, **updates}  
+            merged_state: AgentState = {**state, **updates}  # type: ignore[typeddict-item]
             score = compute_importance_score(merged_state)
             long_term_memory.record_completed_task(merged_state, importance_score=score)
         return updates
@@ -303,9 +389,10 @@ def reviewer_node(
             "trace_log": ["reviewer: approved output"],
         }
         if long_term_memory is not None:
-            merged_state: AgentState = {**state, **updates}  
+            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
             score = compute_importance_score(merged_state)
             long_term_memory.record_completed_task(merged_state, importance_score=score)
+            updates["trace_log"].append("reviewer: archived task into long-term memory")
         return updates
 
     next_cycles = state["review_cycles"] + 1
@@ -325,7 +412,7 @@ def reviewer_node(
             "trace_log": [f"reviewer: failed after exceeding max review cycles ({next_cycles})"],
         }
         if long_term_memory is not None:
-            merged_state: AgentState = {**state, **updates} 
+            merged_state = {**state, **updates}  # type: ignore[typeddict-item]
             score = compute_importance_score(merged_state)
             long_term_memory.record_completed_task(merged_state, importance_score=score)
         return updates

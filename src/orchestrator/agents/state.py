@@ -21,6 +21,10 @@ class AgentState(TypedDict):
     max_review_cycles: int
     last_error: str
     confidence_score: float
+    approval_status: Literal["none", "pending", "approved", "rejected"]
+    pending_approval: dict[str, Any] | None
+    human_decision: dict[str, Any] | None
+    approved_steps: Annotated[list[str], operator.add]
     final_output: str
     trace_log: Annotated[list[str], operator.add]
 
@@ -50,6 +54,10 @@ def create_initial_state(
         "max_review_cycles": max_review_cycles,
         "last_error": "",
         "confidence_score": 1.0,
+        "approval_status": "none",
+        "pending_approval": None,
+        "human_decision": None,
+        "approved_steps": [],
         "final_output": "",
         "trace_log": [],
     }
