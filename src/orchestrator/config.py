@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = "chroma_data"
     hitl_confidence_threshold: float = 0.75
     hitl_consecutive_failure_cap: int = 2
+    max_task_cost_usd: float = 0.50
+    max_task_tokens: int = 50000
 
 
 def get_settings() -> Settings:

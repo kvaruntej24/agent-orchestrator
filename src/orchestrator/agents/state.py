@@ -26,6 +26,9 @@ class AgentState(TypedDict):
     pending_approval: dict[str, Any] | None
     human_decision: dict[str, Any] | None
     approved_steps: Annotated[list[str], operator.add]
+    budget_exceeded: bool
+    total_tokens: int
+    total_cost_usd: float
     final_output: str
     trace_log: Annotated[list[str], operator.add]
 
@@ -60,6 +63,9 @@ def create_initial_state(
         "human_decision": None,
         "approved_steps": [],
         "tool_arg_overrides": {},
+        "budget_exceeded": False,
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
         "final_output": "",
         "trace_log": [],
     }
