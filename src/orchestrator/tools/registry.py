@@ -5,7 +5,7 @@ from typing import Any
 
 from mcp import types as mcp_types
 from pydantic import BaseModel, Field, ValidationError
-
+from opentelemetry.trace import Status, StatusCode
 
 class ToolResult(BaseModel):
     """Standardized response envelope returned by every tool execution."""
@@ -32,8 +32,13 @@ class RegisteredTool:
 class ToolRegistry:
     """Central registry for validating, executing, and exporting agent tools."""
 
-    def __init__(self) -> None:
+    def __init__(self, tracer: Any | None = None) -> None:
         self._tools: dict[str, RegisteredTool] = {}
+        self._tracer = tracer
+
+    def set_tracer(self, tracer: Any | None) -> None:
+        """Attach or detach an ExecutionTracer for automatic tool span capture."""
+        self._tracer = tracer
 
     def register(
         self,
@@ -73,55 +78,61 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
-    def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        """Validate arguments, invoke the tool, and return a structured ToolResult.
+    def execute(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
+        """Validate arguments, invoke the tool safely, and record OpenTelemetry spans."""
+        raw_args = arguments or {}
 
-        Never raises unhandled tool exceptions so the orchestration graph can
-        inspect errors and decide whether to retry or escalate.
-        """
+        if self._tracer is None:
+            return self._execute_core(name, raw_args)
+
+        with self._tracer.start_tool_span(name, list(raw_args.keys())) as span:
+            result = self._execute_core(name, raw_args)
+            span.set_attribute("tool.success", result.success)
+            span.set_attribute("tool.duration_ms", result.duration_ms)
+            if result.success:
+                span.set_status(Status(StatusCode.OK))
+            else:
+                span.set_attribute("tool.error", result.error or "Unknown tool error")
+                span.set_status(
+                    Status(StatusCode.ERROR, result.error or "Tool execution failed")
+                )
+            return result
+
+    def _execute_core(self, name: str, raw_args: dict[str, Any]) -> ToolResult:
+        """Core validation, execution, timing, and error-envelope logic."""
         start = time.perf_counter()
-        tool = self._tools.get(tool_name)
+
+        tool = self._tools.get(name)
         if tool is None:
             return ToolResult(
-                tool_name=tool_name,
+                tool_name=name,
                 success=False,
-                error=f"Unknown tool '{tool_name}'. Available: {self.list_names()}",
-                error_type="ToolNotFoundError",
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=f"ToolNotFoundError: '{name}' is not registered.",
+                duration_ms=round((time.perf_counter() - start) * 1000, 3),
             )
 
         try:
-            validated_args = tool.args_schema.model_validate(arguments)
+            validated_args = tool.args_schema.model_validate(raw_args)
         except ValidationError as exc:
             return ToolResult(
-                tool_name=tool_name,
+                tool_name=name,
                 success=False,
-                error=f"Invalid arguments for '{tool_name}': {exc.errors()}",
-                error_type="ValidationError",
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=f"ArgumentValidationError: {exc.errors()}",
+                duration_ms=round((time.perf_counter() - start) * 1000, 3),
             )
 
         try:
             output = tool.handler(validated_args)
             return ToolResult(
-                tool_name=tool_name,
+                tool_name=name,
                 success=True,
                 output=output,
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
-            )
-        except PermissionError as exc:
-            return ToolResult(
-                tool_name=tool_name,
-                success=False,
-                error=str(exc),
-                error_type="SandboxViolationError",
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                duration_ms=round((time.perf_counter() - start) * 1000, 3),
             )
         except Exception as exc:
             return ToolResult(
-                tool_name=tool_name,
+                tool_name=name,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
-                error_type=type(exc).__name__,
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                duration_ms=round((time.perf_counter() - start) * 1000, 3),
             )

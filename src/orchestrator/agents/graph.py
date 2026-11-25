@@ -2,7 +2,8 @@ from typing import Any, Literal
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-
+from opentelemetry.trace import Status, StatusCode
+from src.orchestrator.observability.tracing import ExecutionTracer
 from src.orchestrator.agents.nodes import (
     ReviewPolicy,
     human_approval_node,
@@ -82,42 +83,77 @@ def build_graph(
     escalation_policy: EscalationPolicy | None = None,
     approval_queue: ApprovalQueue | None = None,
     checkpointer: Any | None = None,
+    tracer: ExecutionTracer | None = None,
 ) -> Any:
-    """Assemble the LangGraph state machine with memory and HITL pause/resume checkpointing."""
+    """Assemble the LangGraph state machine with memory, HITL, and OpenTelemetry tracing."""
     active_planner = planner or TaskPlanner()
     active_registry = registry or register_builtin_tools(ToolRegistry())
+    if tracer is not None:
+        active_registry.set_tracer(tracer)
 
     # Auto-enable checkpointing whenever HITL escalation is active
     active_checkpointer = checkpointer
     if escalation_policy is not None and active_checkpointer is None:
         active_checkpointer = MemorySaver()
 
+    def _run_traced_node(
+        node_name: str,
+        state: AgentState,
+        fn: Any,
+    ) -> dict[str, Any]:
+        if tracer is None:
+            return dict(fn())
+        with tracer.start_node_span(node_name, dict(state)) as span:
+            updates = dict(fn())
+            if updates.get("last_error"):
+                span.set_attribute("node.error", str(updates["last_error"]))
+                span.set_status(Status(StatusCode.ERROR, str(updates["last_error"])))
+            else:
+                span.set_status(Status(StatusCode.OK))
+            return updates
+
     def _supervisor(state: AgentState) -> dict[str, Any]:
-        return supervisor_node(
+        return _run_traced_node(
+            "supervisor",
             state,
-            planner=active_planner,
-            working_memory=working_memory,
-            memory_retriever=memory_retriever,
+            lambda: supervisor_node(
+                state,
+                planner=active_planner,
+                working_memory=working_memory,
+                memory_retriever=memory_retriever,
+            ),
         )
 
     def _specialist(state: AgentState) -> dict[str, Any]:
-        return specialist_node(
+        return _run_traced_node(
+            "specialist",
             state,
-            registry=active_registry,
-            working_memory=working_memory,
-            escalation_policy=escalation_policy,
-            approval_queue=approval_queue,
+            lambda: specialist_node(
+                state,
+                registry=active_registry,
+                working_memory=working_memory,
+                escalation_policy=escalation_policy,
+                approval_queue=approval_queue,
+            ),
         )
 
     def _human_approval(state: AgentState) -> dict[str, Any]:
-        return human_approval_node(state, working_memory=working_memory)
+        return _run_traced_node(
+            "human_approval",
+            state,
+            lambda: human_approval_node(state, working_memory=working_memory),
+        )
 
     def _reviewer(state: AgentState) -> dict[str, Any]:
-        return reviewer_node(
+        return _run_traced_node(
+            "reviewer",
             state,
-            review_policy=review_policy,
-            working_memory=working_memory,
-            long_term_memory=long_term_memory,
+            lambda: reviewer_node(
+                state,
+                review_policy=review_policy,
+                working_memory=working_memory,
+                long_term_memory=long_term_memory,
+            ),
         )
 
     builder = StateGraph(AgentState)
