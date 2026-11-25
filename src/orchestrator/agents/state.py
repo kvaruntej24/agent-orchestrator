@@ -12,6 +12,7 @@ class AgentState(TypedDict):
     plan: list[dict[str, Any]]
     current_step_index: int
     assigned_specialist: str
+    tool_arg_overrides: dict[str, dict[str, Any]]
     subtask_results: Annotated[list[dict[str, Any]], operator.add]
     review_status: Literal["pending", "approved", "rejected", "failed"]
     review_feedback: str
@@ -58,6 +59,7 @@ def create_initial_state(
         "pending_approval": None,
         "human_decision": None,
         "approved_steps": [],
+        "tool_arg_overrides": {},
         "final_output": "",
         "trace_log": [],
     }

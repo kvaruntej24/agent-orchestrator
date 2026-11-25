@@ -47,10 +47,21 @@ def route_after_specialist(
 
 def route_after_human_approval(
     state: AgentState,
-) -> Literal["specialist", "reviewer"]:
-    """Resume execution on human approval, or fail cleanly via reviewer on rejection."""
+) -> Literal["supervisor", "specialist", "reviewer"]:
+    """Route post-HITL resolution according to the applied approval tier."""
     if state["last_error"]:
         return "reviewer"
+
+    decision_payload = state["human_decision"] or {}
+    tier = str(decision_payload.get("tier", ""))
+    decision = str(decision_payload.get("decision") or decision_payload.get("status") or "")
+
+    if tier == "human_takeover" or decision == "taken_over":
+        return "reviewer"
+    if state["current_step_index"] >= len(state["plan"]):
+        return "reviewer"
+    if tier == "modify_plan" or decision == "modified":
+        return "supervisor"
     return "specialist"
 
 
@@ -135,7 +146,11 @@ def build_graph(
     builder.add_conditional_edges(
         "human_approval",
         route_after_human_approval,
-        {"specialist": "specialist", "reviewer": "reviewer"},
+        {
+            "supervisor": "supervisor",
+            "specialist": "specialist",
+            "reviewer": "reviewer",
+        },
     )
     builder.add_conditional_edges(
         "reviewer",

@@ -11,6 +11,7 @@ from src.orchestrator.memory.retrieval import MemoryRetriever
 from src.orchestrator.memory.working_memory import WorkingMemoryStore
 from src.orchestrator.tools.builtin import register_builtin_tools
 from src.orchestrator.tools.registry import ToolRegistry
+from src.orchestrator.hitl.tiers import apply_human_resolution
 
 # Optional custom review hook: (latest_output, state) -> (is_approved, feedback)
 ReviewPolicy = Callable[[str, AgentState], tuple[bool, str]]
@@ -172,8 +173,10 @@ def specialist_node(
     step_id = current_task["step_id"]
 
     tool_name, tool_args = _select_tool_call(specialist, current_task, state)
+    tool_name, tool_args = _select_tool_call(specialist, current_task, state)
+    notify_traces: list[str] = []
 
-    # Pre-execution HITL gate (skips if this step_id was already human-approved)
+    # Pre-execution HITL gate (skips blocking pause if step_id was already human-approved)
     if escalation_policy is not None and step_id not in state["approved_steps"]:
         decision = escalation_policy.evaluate(
             state=state,
@@ -188,26 +191,40 @@ def specialist_node(
                 step_id=step_id,
                 decision=decision,
             )
-            if approval_queue is not None:
-                approval_queue.enqueue(review_req)
-            _persist_state(
-                working_memory,
-                state["task_id"],
-                {
-                    "phase": "awaiting_human_approval",
-                    "step_id": step_id,
-                    "review_id": review_req.review_id,
-                    "reason": decision.reason,
-                },
-            )
-            return {
-                "approval_status": "pending",
-                "pending_approval": review_req.model_dump(),
-                "trace_log": [
-                    f"specialist({specialist}): paused {step_id} for HITL approval "
-                    f"(review_id={review_req.review_id}, reason={decision.reason})"
-                ],
-            }
+            if decision.recommended_tier == "notify":
+                if approval_queue is not None:
+                    approval_queue.record_notification(review_req)
+                notify_traces.append(
+                    f"specialist({specialist}): logged non-blocking HITL notify for "
+                    f"{step_id} ({tool_name})"
+                )
+            else:
+                if approval_queue is not None:
+                    approval_queue.enqueue(review_req)
+                _persist_state(
+                    working_memory,
+                    state["task_id"],
+                    {
+                        "phase": "awaiting_human_approval",
+                        "step_id": step_id,
+                        "review_id": review_req.review_id,
+                        "reason": decision.reason,
+                        "recommended_tier": decision.recommended_tier,
+                    },
+                )
+                return {
+                    "approval_status": "pending",
+                    "pending_approval": review_req.model_dump(),
+                    "trace_log": [
+                        f"specialist({specialist}): paused {step_id} for HITL approval "
+                        f"(review_id={review_req.review_id}, tier={decision.recommended_tier}, "
+                        f"reason={decision.reason})"
+                    ],
+                }
+
+    # Apply human-modified tool arguments if approved via Tier 2 override
+    if step_id in state["tool_arg_overrides"]:
+        tool_args = {**tool_args, **state["tool_arg_overrides"][step_id]}
 
     tool_result = active_registry.execute(tool_name, tool_args)
 
@@ -289,46 +306,21 @@ def human_approval_node(
     state: AgentState,
     working_memory: WorkingMemoryStore | None = None,
 ) -> dict[str, Any]:
-    """Process a human approve/reject decision after LangGraph resumes from checkpoint."""
-    pending = state["pending_approval"] or {}
+    """Process a human resolution across all four HITL approval tiers."""
     decision_payload = state["human_decision"] or {}
-    step_id = str(pending.get("step_id", "unknown_step"))
-    reviewer = str(decision_payload.get("reviewer", "human_reviewer"))
-    comment = str(decision_payload.get("reviewer_comment", ""))
-    decision_status = str(decision_payload.get("status", state["approval_status"]))
+    updates = apply_human_resolution(state, decision_payload)
 
-    if decision_status == "approved":
-        _persist_state(
-            working_memory,
-            state["task_id"],
-            {"phase": "human_approved", "step_id": step_id, "reviewer": reviewer},
-        )
-        return {
-            "approval_status": "none",
-            "pending_approval": None,
-            "approved_steps": [step_id],
-            "trace_log": [
-                f"human_approval: '{step_id}' approved by {reviewer}"
-                + (f" ({comment})" if comment else "")
-            ],
-        }
-
-    rejection_msg = (
-        f"Human reviewer '{reviewer}' rejected '{step_id}'"
-        + (f": {comment}" if comment else "")
-    )
     _persist_state(
         working_memory,
         state["task_id"],
-        {"phase": "human_rejected", "step_id": step_id, "reviewer": reviewer},
+        {
+            "phase": "human_resolution_applied",
+            "tier": decision_payload.get("tier", "approve_action"),
+            "decision": decision_payload.get("decision") or decision_payload.get("status"),
+            "reviewer": decision_payload.get("reviewer", "human_reviewer"),
+        },
     )
-    return {
-        "approval_status": "none",
-        "pending_approval": None,
-        "last_error": rejection_msg,
-        "trace_log": [f"human_approval: {rejection_msg}"],
-    }
-
+    return updates
 
 def _default_review_policy(latest_output: str, state: AgentState) -> tuple[bool, str]:
     """Baseline deterministic quality gate for offline validation."""

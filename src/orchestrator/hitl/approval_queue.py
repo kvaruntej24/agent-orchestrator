@@ -18,7 +18,14 @@ from src.orchestrator.hitl.triggers import (
     EscalationSeverity,
 )
 
-ReviewDecisionStatus = Literal["pending", "approved", "rejected"]
+ReviewDecisionStatus = Literal[
+    "pending",
+    "approved",
+    "rejected",
+    "modified",
+    "taken_over",
+    "notified",
+]
 
 
 class HitlBase(DeclarativeBase):
@@ -162,6 +169,48 @@ class ApprovalQueue:
 
         return request
 
+    def record_notification(self, request: ReviewRequest) -> ReviewRequest:
+        """Persist a non-blocking Tier-1 Notify audit record (never added to pending queue)."""
+        notified = request.model_copy(
+            update={
+                "status": "notified",
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        now = datetime.now(timezone.utc)
+        with Session(self._engine) as session:
+            session.add(
+                ApprovalRequestRecord(
+                    review_id=notified.review_id,
+                    task_id=notified.task_id,
+                    thread_id=notified.thread_id,
+                    step_id=notified.step_id,
+                    reason=notified.reason,
+                    severity=notified.severity,
+                    recommended_tier="notify",
+                    details=notified.details,
+                    proposed_action_json=json.dumps(notified.proposed_action, default=str),
+                    status="notified",
+                    reviewer="system_audit",
+                    reviewer_comment="Non-blocking notification logged.",
+                    resolved_at=now,
+                )
+            )
+            session.commit()
+
+        self._redis.set(self._request_key(notified.review_id), notified.model_dump_json())
+        return notified
+
+    def list_all(self, limit: int = 50) -> list[ReviewRequest]:
+        """Return recent HITL requests across all statuses (pending, resolved, notified)."""
+        with Session(self._engine) as session:
+            stmt = (
+                select(ApprovalRequestRecord)
+                .order_by(ApprovalRequestRecord.created_at.desc())
+                .limit(limit)
+            )
+            return [self._row_to_model(row) for row in session.scalars(stmt).all()]
+        
     def get(self, review_id: str) -> ReviewRequest | None:
         """Fetch a review payload (fast path from Redis, fallback to PostgreSQL)."""
         cached = self._redis.get(self._request_key(review_id))
@@ -197,7 +246,7 @@ class ApprovalQueue:
     def resolve(
         self,
         review_id: str,
-        decision: Literal["approved", "rejected"],
+        decision: Literal["approved", "rejected", "modified", "taken_over"],
         reviewer: str,
         comment: str = "",
     ) -> ReviewRequest:

@@ -47,6 +47,7 @@ class EscalationPolicy:
         confidence_threshold: float = 0.75,
         consecutive_failure_cap: int = 2,
         sensitive_tools: set[str] | None = None,
+        notify_tools: set[str] | None = None,
     ) -> None:
         if not 0.0 <= confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must be between 0.0 and 1.0.")
@@ -61,6 +62,7 @@ class EscalationPolicy:
             "db_write",
             "db_delete",
         }
+        self.notify_tools = notify_tools or set()
 
     def check_sensitive_action(
         self,
@@ -87,6 +89,15 @@ class EscalationPolicy:
             reasons.append("SQL payload contains a write/destructive keyword")
 
         if not reasons:
+            if lowered_name in self.notify_tools:
+                return EscalationDecision(
+                    should_escalate=True,
+                    reason="sensitive_action",
+                    severity="low",
+                    recommended_tier="notify",
+                    details=f"Non-blocking audit notification for tool '{tool_name}'.",
+                    proposed_action={"tool_name": tool_name, "arguments": arguments},
+                )
             return EscalationDecision(
                 should_escalate=False,
                 details=f"Tool '{tool_name}' is safe for autonomous execution.",
