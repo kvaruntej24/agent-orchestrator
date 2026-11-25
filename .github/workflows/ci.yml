@@ -1,0 +1,52 @@
+name: Agent Orchestrator CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-suite:
+    name: Pytest Suite (Python 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full Pytest suite
+        env:
+          OPENAI_API_KEY: sk-ci-test-openai
+          ANTHROPIC_API_KEY: sk-ant-ci-test-anthropic
+          ORCHESTRATOR_STORAGE_MODE: in_memory
+          ORCHESTRATOR_LIVE_LLM: "false"
+        run: pytest
+
+  docker-validation:
+    name: Validate Dockerfile & Docker Compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create CI dummy .env for compose validation
+        run: cp .env.example .env
+
+      - name: Validate docker-compose.yml schema
+        run: docker compose config --quiet
+
+      - name: Build production Docker image
+        run: docker build -t agent-orchestrator:ci .
