@@ -1,0 +1,96 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: orchestrator-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: orchestrator-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_orchestrator}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agent_orchestrator}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-api
+    env_file:
+      - .env
+    environment:
+      ORCHESTRATOR_STORAGE_MODE: live
+      ORCHESTRATOR_LIVE_LLM: ${ORCHESTRATOR_LIVE_LLM:-false}
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-agent_orchestrator}
+      CHROMA_PERSIST_DIR: /app/chroma_data
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/app/chroma_data
+      - workspace_data:/app/workspace
+      - replay_data:/app/replay_recordings
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  hitl_ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-hitl-ui
+    command:
+      [
+        "streamlit",
+        "run",
+        "src/orchestrator/ui/hitl_dashboard.py",
+        "--server.port=8501",
+        "--server.address=0.0.0.0",
+        "--server.headless=true",
+      ]
+    env_file:
+      - .env
+    environment:
+      ORCHESTRATOR_API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
+  chroma_data:
+  workspace_data:
+  replay_data:

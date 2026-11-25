@@ -1,6 +1,13 @@
 import uuid
+import os
+import uuid
 from typing import Any
-
+from typing import Any
+from src.orchestrator.config import get_settings
+from src.orchestrator.memory.long_term_memory import (
+    LongTermMemoryStore,
+    OpenAIEmbedder,
+)
 from fastapi import FastAPI, HTTPException
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
@@ -128,6 +135,7 @@ class OrchestratorService:
             ),
         )
 
+    
     @classmethod
     def from_urls(
         cls,
@@ -137,6 +145,8 @@ class OrchestratorService:
         working_memory_ttl_seconds: int = 3600,
         max_cost_usd: float = 0.50,
         max_tokens: int = 50000,
+        planner: TaskPlanner | None = None,
+        embedder: Any | None = None,
     ) -> "OrchestratorService":
         """Build a live production runtime connected to Redis, PostgreSQL, and ChromaDB."""
         return cls(
@@ -147,11 +157,13 @@ class OrchestratorService:
             long_term_memory=LongTermMemoryStore.from_dsn(
                 postgres_dsn=postgres_dsn,
                 chroma_persist_dir=chroma_persist_dir,
+                embedder=embedder,
             ),
             approval_queue=ApprovalQueue.from_urls(
                 postgres_dsn=postgres_dsn,
                 redis_url=redis_url,
             ),
+            planner=planner,
             cost_tracker=CostTracker(
                 max_cost_usd=max_cost_usd,
                 max_tokens=max_tokens,
@@ -349,7 +361,48 @@ class OrchestratorService:
             call_overrides=call_overrides,
         )
 
+def build_service_from_env() -> OrchestratorService:
+    """Build an OrchestratorService from environment variables (in_memory or live Docker stack)."""
+    storage_mode = os.getenv("ORCHESTRATOR_STORAGE_MODE", "in_memory").strip().lower()
+    live_llm = os.getenv("ORCHESTRATOR_LIVE_LLM", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
+    if storage_mode == "live":
+        settings = get_settings()
+        planner = TaskPlanner(mock=not live_llm)
+        embedder = (
+            OpenAIEmbedder(api_key=settings.openai_api_key) if live_llm else None
+        )
+        return OrchestratorService.from_urls(
+            redis_url=settings.redis_url,
+            postgres_dsn=settings.postgres_dsn,
+            chroma_persist_dir=settings.chroma_persist_dir,
+            working_memory_ttl_seconds=settings.working_memory_ttl_seconds,
+            max_cost_usd=settings.max_task_cost_usd,
+            max_tokens=settings.max_task_tokens,
+            planner=planner,
+            embedder=embedder,
+        )
+
+    if live_llm:
+        settings = get_settings()
+        return OrchestratorService(
+            working_memory=WorkingMemoryStore.in_memory(),
+            long_term_memory=LongTermMemoryStore.in_memory(
+                embedder=OpenAIEmbedder(api_key=settings.openai_api_key)
+            ),
+            approval_queue=ApprovalQueue.in_memory(),
+            planner=TaskPlanner(mock=False),
+            cost_tracker=CostTracker(
+                max_cost_usd=settings.max_task_cost_usd,
+                max_tokens=settings.max_task_tokens,
+            ),
+        )
+
+    return OrchestratorService.in_memory()
 # ---------- FastAPI Application Factory ----------
 
 def create_app(service: OrchestratorService | None = None) -> FastAPI:
@@ -365,7 +418,13 @@ def create_app(service: OrchestratorService | None = None) -> FastAPI:
             "and deterministic replay."
         ),
     )
-
+    @app.get("/", tags=["system"])
+    def root() -> dict[str, str]:
+        return {
+            "service": "Enterprise Agent Orchestration Platform",
+            "docs": "/docs",
+            "health": "/health",
+        }
     # Mount Phase 2.4 memory consolidation & GDPR privacy purge endpoints
     app.include_router(create_memory_router(active_service.maintenance))
 
@@ -463,4 +522,4 @@ def create_app(service: OrchestratorService | None = None) -> FastAPI:
 
 
 # Default ASGI app entrypoint for `uvicorn src.orchestrator.api.app:app --reload`
-app = create_app()
+app = create_app(build_service_from_env())

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +18,8 @@ class Settings(BaseSettings):
     hitl_consecutive_failure_cap: int = 2
     max_task_cost_usd: float = 0.50
     max_task_tokens: int = 50000
+    orchestrator_storage_mode: Literal["in_memory", "live"] = "in_memory"
+    orchestrator_live_llm: bool = False
 
 
 def get_settings() -> Settings:
