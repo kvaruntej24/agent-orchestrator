@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 workspace/
 chroma_data/
+replay_recordings/
