@@ -16,3 +16,4 @@ httpx
 streamlit
 opentelemetry-api
 opentelemetry-sdk
+uvicorn

@@ -62,7 +62,7 @@ def _resolve_sandbox_path(workspace_dir: Path, relative_path: str) -> Path:
 
 def _create_mock_db() -> sqlite3.Connection:
     """Build an in-memory SQLite database with sample enterprise records."""
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
