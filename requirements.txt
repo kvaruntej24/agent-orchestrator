@@ -13,3 +13,4 @@ psycopg[binary]
 chromadb
 fastapi
 httpx
+streamlit
